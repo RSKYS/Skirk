@@ -43,6 +43,8 @@ func run(args []string) error {
 		return nil
 	case "workspace":
 		return workspace(ctx, args[2:])
+	case "setup":
+		return setup(ctx, args[2:])
 	case "hybrid-send":
 		return hybridSend(ctx, args[2:])
 	case "hybrid-recv":
@@ -67,8 +69,9 @@ func usage() {
 	fmt.Println(`skirk commands:
   keygen
   sample-config --out skirk.json --spreadsheet-id SHEET_ID --secret SECRET
+  setup init --out skirk-kit
   workspace create --config skirk.json --title TITLE --sheet skirk
-  workspace delete --config skirk.json --spreadsheet-id SHEET_ID
+  workspace delete --config skirk.json --spreadsheet-id SHEET_ID [--delete-drive-folder]
   hybrid-send --config skirk.json --input file.bin [--session SESSION]
   hybrid-recv --config skirk.json --output file.bin --session SESSION [--delete-after]
   e2e --config skirk.json [--bytes 2048] [--delete-after]
@@ -95,6 +98,8 @@ func workspace(ctx context.Context, args []string) error {
 	title := fs.String("title", "skirk-workspace", "spreadsheet title")
 	sheet := fs.String("sheet", "skirk", "sheet title")
 	spreadsheetID := fs.String("spreadsheet-id", "", "spreadsheet id")
+	driveFolderID := fs.String("drive-folder-id", "", "Drive folder id")
+	deleteDriveFolder := fs.Bool("delete-drive-folder", false, "also delete the Drive folder from config or --drive-folder-id")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -110,12 +115,12 @@ func workspace(ctx context.Context, args []string) error {
 		}
 		return printJSON(map[string]string{"spreadsheet_id": id})
 	case "delete":
+		cfg, err := skirk.LoadConfig(*configPath)
+		if err != nil {
+			return err
+		}
 		id := *spreadsheetID
 		if id == "" {
-			cfg, err := skirk.LoadConfig(*configPath)
-			if err != nil {
-				return err
-			}
 			id = cfg.Sheets.SpreadsheetID
 		}
 		if id == "" {
@@ -124,7 +129,17 @@ func workspace(ctx context.Context, args []string) error {
 		if err := workspace.DeleteSpreadsheet(ctx, id); err != nil {
 			return err
 		}
-		return printJSON(map[string]string{"deleted_spreadsheet_id": id})
+		deleted := map[string]string{"deleted_spreadsheet_id": id}
+		if *deleteDriveFolder {
+			folderID := firstNonEmpty(*driveFolderID, cfg.Drive.FolderID)
+			if folderID != "" {
+				if err := workspace.DeleteDriveFile(ctx, folderID); err != nil {
+					return err
+				}
+				deleted["deleted_drive_folder_id"] = folderID
+			}
+		}
+		return printJSON(deleted)
 	default:
 		return fmt.Errorf("unknown workspace command %q", args[0])
 	}

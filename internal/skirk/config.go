@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -24,6 +27,10 @@ type Config struct {
 type AuthConfig struct {
 	AccessToken  string `json:"access_token,omitempty"`
 	TokenCommand string `json:"token_command,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	TokenURL     string `json:"token_url,omitempty"`
 }
 
 type RouteConfig struct {
@@ -110,15 +117,22 @@ func (c *Config) Validate() error {
 }
 
 func (a AuthConfig) Token(ctx context.Context) (string, error) {
+	return a.TokenForRoute(ctx, RouteConfig{Mode: "direct"})
+}
+
+func (a AuthConfig) TokenForRoute(ctx context.Context, route RouteConfig) (string, error) {
 	if token := strings.TrimSpace(os.Getenv("SKIRK_ACCESS_TOKEN")); token != "" {
 		return token, nil
 	}
 	if token := strings.TrimSpace(a.AccessToken); token != "" {
 		return token, nil
 	}
+	if strings.TrimSpace(a.RefreshToken) != "" {
+		return a.refreshAccessToken(ctx, route)
+	}
 	command := strings.TrimSpace(a.TokenCommand)
 	if command == "" {
-		return "", errors.New("no access token or token_command configured")
+		return "", errors.New("no access token, refresh token, or token_command configured")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
@@ -138,6 +152,72 @@ func (a AuthConfig) Token(ctx context.Context) (string, error) {
 		return "", errors.New("token command returned an empty token")
 	}
 	return token, nil
+}
+
+func (a AuthConfig) refreshAccessToken(ctx context.Context, route RouteConfig) (string, error) {
+	clientID := strings.TrimSpace(a.ClientID)
+	if clientID == "" {
+		return "", errors.New("auth.client_id is required when auth.refresh_token is set")
+	}
+	tokenURL := strings.TrimSpace(a.TokenURL)
+	if tokenURL == "" {
+		tokenURL = "https://oauth2.googleapis.com/token"
+	}
+	values := url.Values{}
+	values.Set("client_id", clientID)
+	values.Set("refresh_token", strings.TrimSpace(a.RefreshToken))
+	values.Set("grant_type", "refresh_token")
+	if secret := strings.TrimSpace(a.ClientSecret); secret != "" {
+		values.Set("client_secret", secret)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	if tokenURL == "https://oauth2.googleapis.com/token" {
+		headers := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
+		result, err := NewGoogleHTTPClient(route).Request(ctx, http.MethodPost, "oauth2.googleapis.com", "/token", headers, []byte(values.Encode()))
+		if err != nil {
+			return "", err
+		}
+		return parseOAuthTokenResponse(result.Status, result.Body)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(values.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	return parseOAuthTokenResponse(resp.StatusCode, body)
+}
+
+func parseOAuthTokenResponse(status int, body []byte) (string, error) {
+	var payload struct {
+		AccessToken      string `json:"access_token"`
+		TokenType        string `json:"token_type"`
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf("oauth token response decode failed: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		if payload.Error != "" {
+			return "", fmt.Errorf("oauth token refresh failed status=%d error=%s description=%s", status, payload.Error, payload.ErrorDescription)
+		}
+		return "", fmt.Errorf("oauth token refresh failed status=%d body=%q", status, string(body))
+	}
+	if strings.TrimSpace(payload.AccessToken) == "" {
+		return "", errors.New("oauth token refresh returned an empty access_token")
+	}
+	return strings.TrimSpace(payload.AccessToken), nil
 }
 
 func (c Config) PollInterval() time.Duration {

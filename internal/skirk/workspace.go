@@ -52,15 +52,52 @@ func (w *Workspace) CreateSpreadsheet(ctx context.Context, title, sheetTitle str
 	return payload.SpreadsheetID, nil
 }
 
+func (w *Workspace) CreateDriveFolder(ctx context.Context, name string) (string, error) {
+	if name == "" {
+		name = "skirk-data"
+	}
+	body, err := json.Marshal(map[string]string{
+		"name":     name,
+		"mimeType": "application/vnd.google-apps.folder",
+	})
+	if err != nil {
+		return "", err
+	}
+	result, err := w.http.Request(ctx, http.MethodPost, "www.googleapis.com", "/drive/v3/files?fields=id,name", w.jsonHeaders(), body)
+	if err != nil {
+		return "", err
+	}
+	if err := require2xx(result, "drive folder create"); err != nil {
+		return "", err
+	}
+	var payload struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(result.Body, &payload); err != nil {
+		return "", err
+	}
+	if payload.ID == "" {
+		return "", fmt.Errorf("drive folder create response did not include id")
+	}
+	return payload.ID, nil
+}
+
 func (w *Workspace) DeleteSpreadsheet(ctx context.Context, spreadsheetID string) error {
-	result, err := w.http.Request(ctx, http.MethodDelete, "www.googleapis.com", "/drive/v3/files/"+url.PathEscape(spreadsheetID), w.authHeaders(), nil)
+	return w.DeleteDriveFile(ctx, spreadsheetID)
+}
+
+func (w *Workspace) DeleteDriveFile(ctx context.Context, fileID string) error {
+	if fileID == "" {
+		return nil
+	}
+	result, err := w.http.Request(ctx, http.MethodDelete, "www.googleapis.com", "/drive/v3/files/"+url.PathEscape(fileID), w.authHeaders(), nil)
 	if err != nil {
 		return err
 	}
 	if result.Status == http.StatusNoContent || result.Status == http.StatusOK || result.Status == http.StatusNotFound {
 		return nil
 	}
-	return require2xx(result, "workspace delete")
+	return require2xx(result, "drive file delete")
 }
 
 func (w *Workspace) jsonHeaders() map[string]string {
@@ -74,7 +111,7 @@ func (w *Workspace) authHeaders() map[string]string {
 }
 
 func StoresFromConfig(ctx context.Context, cfg *Config) (*DriveStore, *SheetsLog, *Workspace, error) {
-	token, err := cfg.Auth.Token(ctx)
+	token, err := cfg.Auth.TokenForRoute(ctx, cfg.Route)
 	if err != nil {
 		return nil, nil, nil, err
 	}

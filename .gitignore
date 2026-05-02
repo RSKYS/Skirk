@@ -5,6 +5,8 @@ __pycache__/
 
 # Secrets and generated configs
 skirk.json
+skirk-kit/
+skirk-config/
 *.secret
 *.token
 

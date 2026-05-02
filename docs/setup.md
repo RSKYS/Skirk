@@ -1,0 +1,101 @@
+# Skirk Setup Guide
+
+This is the intended user flow:
+
+1. The operator runs Skirk on a machine with Google login available.
+2. Skirk creates a dedicated Google Sheet and Drive folder.
+3. Skirk writes `exit.json` and `client.json`.
+4. The operator runs the exit on a VPS, laptop, or home server.
+5. Clients import `client.json` and start a local SOCKS5 proxy.
+
+## Does Skirk Need A VPS?
+
+No. Skirk does not need an inbound server port because both sides exchange encrypted messages through Google Drive and Google Sheets.
+
+It does need an exit machine. The exit is the machine that dials the real internet targets. A VPS is best for uptime and stable egress, but a laptop works while it is awake and online.
+
+## First-Time Setup
+
+Build the binary:
+
+```bash
+make build
+```
+
+Create the Google-backed kit:
+
+```bash
+./bin/skirk setup init --out skirk-kit
+```
+
+If Application Default Credentials are missing, setup runs:
+
+```bash
+gcloud auth login --no-launch-browser --enable-gdrive-access --update-adc --force
+```
+
+That command prints a browser URL and code. Open the URL, approve the Google account, paste the code back into the terminal, then setup continues.
+
+## Generated Files
+
+`skirk-kit/exit.json`:
+Use this on the exit machine.
+
+`skirk-kit/client.json`:
+Send this to clients. Clients do not need Google login, OAuth, or `gcloud`.
+
+`skirk-kit/README.md`:
+Per-kit run and cleanup commands.
+
+Both JSON files contain a Google refresh token and the Skirk tunnel secret. Do not commit them.
+
+## Run The Exit
+
+On the VPS, laptop, or server:
+
+```bash
+./bin/skirk serve-exit --config skirk-kit/exit.json
+```
+
+## Run A Linux Client
+
+On the client:
+
+```bash
+./bin/skirk serve-client --config client.json --listen 127.0.0.1:18080
+```
+
+Point apps at SOCKS5:
+
+```bash
+curl --socks5-hostname 127.0.0.1:18080 http://example.com/
+```
+
+Use `socks5h` semantics in apps that support it so DNS resolution happens through the exit path.
+
+## Restricted Networks
+
+The default generated client route is `google_front_pinned`, which connects with Google-looking SNI while sending the real Google API Host header after TLS. The default exit route is `direct`, because the exit normally has ordinary internet.
+
+For normal-network clients where speed matters more than reachability, generate direct configs:
+
+```bash
+./bin/skirk setup init --out skirk-kit-direct --client-route direct
+```
+
+## Disconnect A Config
+
+To clean up the workspace:
+
+```bash
+./bin/skirk workspace delete --config skirk-kit/exit.json --delete-drive-folder
+```
+
+To revoke every config generated from the same OAuth login, remove the app access from Google Account security settings. Workspace deletion removes Skirk's current mailbox; OAuth revocation prevents old configs from creating or using another mailbox.
+
+## Operational Notes
+
+- One Google account can create multiple kits, but each kit should use its own Sheet, Drive folder, secret, and session.
+- The current protocol is TCP-over-mailbox. It is reliable enough for proof and selected use, but latency is higher than a streaming endpoint.
+- Drive and Sheets rate limits still apply. Use this as an owned-user transport, not as an anonymous public relay.
+- If a client config leaks, revoke OAuth access and generate a new kit.
