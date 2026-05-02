@@ -26,6 +26,7 @@ The important fields are:
 - `route.google_ip`: known Google edge IP for pinned routing.
 - `sheets.spreadsheet_id`: Sheets control-lane spreadsheet.
 - `tunnel.chunk_size`: Drive object payload size. Start conservative, then benchmark.
+- `tunnel.concurrency`: number of parallel Drive upload/download/delete workers.
 - `tunnel.cleanup_processed`: removes Drive chunks and tombstones processed control rows.
 
 ## Why Drive + Sheets
@@ -62,8 +63,9 @@ Throughput:
 ```sh
 go run ./cmd/skirk bench \
   --config skirk.json \
-  --sizes 65536,1048576 \
-  --chunk-sizes 65536,262144
+  --sizes 1048576,33554432 \
+  --chunk-sizes 1048576,4194304 \
+  --concurrency 16
 ```
 
 SOCKS path:

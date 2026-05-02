@@ -46,6 +46,7 @@ type TunnelConfig struct {
 	Listen           string `json:"listen,omitempty"`
 	ChunkSize        int    `json:"chunk_size,omitempty"`
 	PollIntervalMS   int    `json:"poll_interval_ms,omitempty"`
+	Concurrency      int    `json:"concurrency,omitempty"`
 	CleanupProcessed bool   `json:"cleanup_processed,omitempty"`
 }
 
@@ -90,14 +91,20 @@ func (c *Config) ApplyDefaults() {
 	if c.Tunnel.PollIntervalMS == 0 {
 		c.Tunnel.PollIntervalMS = 1200
 	}
+	if c.Tunnel.Concurrency == 0 {
+		c.Tunnel.Concurrency = 8
+	}
 }
 
 func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Secret) == "" {
 		return errors.New("config.secret is required")
 	}
-	if c.Tunnel.ChunkSize < 512 || c.Tunnel.ChunkSize > 256*1024 {
-		return fmt.Errorf("config.tunnel.chunk_size must be between 512 and 262144 bytes")
+	if c.Tunnel.ChunkSize < 512 || c.Tunnel.ChunkSize > 16*1024*1024 {
+		return fmt.Errorf("config.tunnel.chunk_size must be between 512 and 16777216 bytes")
+	}
+	if c.Tunnel.Concurrency < 1 || c.Tunnel.Concurrency > 32 {
+		return fmt.Errorf("config.tunnel.concurrency must be between 1 and 32")
 	}
 	return nil
 }

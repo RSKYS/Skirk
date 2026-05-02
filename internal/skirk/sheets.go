@@ -20,6 +20,13 @@ type SheetsLog struct {
 	rangeName     string
 }
 
+type SheetRecord struct {
+	Name      string
+	Data      []byte
+	UpdatedNS string
+	Action    string
+}
+
 func NewSheetsLog(httpClient *GoogleHTTPClient, token string, cfg SheetsConfig) *SheetsLog {
 	rangeName := cfg.Range
 	if rangeName == "" {
@@ -29,7 +36,27 @@ func NewSheetsLog(httpClient *GoogleHTTPClient, token string, cfg SheetsConfig) 
 }
 
 func (s *SheetsLog) Put(ctx context.Context, name string, data []byte) error {
-	return s.append(ctx, []string{name, base64.URLEncoding.EncodeToString(data), strconv.FormatInt(time.Now().UnixNano(), 10), "put"})
+	return s.PutMany(ctx, []SheetRecord{{Name: name, Data: data, UpdatedNS: strconv.FormatInt(time.Now().UnixNano(), 10), Action: "put"}})
+}
+
+func (s *SheetsLog) PutMany(ctx context.Context, records []SheetRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	rows := make([][]string, 0, len(records))
+	now := strconv.FormatInt(time.Now().UnixNano(), 10)
+	for _, record := range records {
+		updated := record.UpdatedNS
+		if updated == "" {
+			updated = now
+		}
+		action := record.Action
+		if action == "" {
+			action = "put"
+		}
+		rows = append(rows, []string{record.Name, base64.URLEncoding.EncodeToString(record.Data), updated, action})
+	}
+	return s.appendRows(ctx, rows)
 }
 
 func (s *SheetsLog) Get(ctx context.Context, name string) ([]byte, error) {
@@ -50,39 +77,68 @@ func (s *SheetsLog) Get(ctx context.Context, name string) ([]byte, error) {
 }
 
 func (s *SheetsLog) List(ctx context.Context, prefix string) ([]ObjectInfo, error) {
-	rows, err := s.rows(ctx)
+	records, err := s.Entries(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
-	latest := map[string][]string{}
-	for _, row := range rows {
-		if len(row) >= 4 && strings.HasPrefix(row[0], prefix) {
-			latest[row[0]] = row
-		}
-	}
 	var infos []ObjectInfo
-	for name, row := range latest {
-		if row[3] == "delete" {
+	for _, record := range records {
+		if record.Action == "delete" {
 			continue
 		}
-		infos = append(infos, ObjectInfo{Name: name, Size: int64(len(row[1])), Updated: row[2]})
+		infos = append(infos, ObjectInfo{Name: record.Name, Size: int64(len(record.Data)), Updated: record.UpdatedNS})
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].Name < infos[j].Name })
 	return infos, nil
 }
 
-func (s *SheetsLog) Delete(ctx context.Context, name string) error {
-	return s.append(ctx, []string{name, "", strconv.FormatInt(time.Now().UnixNano(), 10), "delete"})
+func (s *SheetsLog) Entries(ctx context.Context, prefix string) ([]SheetRecord, error) {
+	rows, err := s.rows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	latest := map[string]SheetRecord{}
+	for _, row := range rows {
+		if len(row) < 4 || !strings.HasPrefix(row[0], prefix) {
+			continue
+		}
+		data, _ := base64.URLEncoding.DecodeString(row[1])
+		latest[row[0]] = SheetRecord{Name: row[0], Data: data, UpdatedNS: row[2], Action: row[3]}
+	}
+	records := make([]SheetRecord, 0, len(latest))
+	for _, record := range latest {
+		if record.Action != "delete" {
+			records = append(records, record)
+		}
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Name < records[j].Name })
+	return records, nil
 }
 
-func (s *SheetsLog) append(ctx context.Context, row []string) error {
+func (s *SheetsLog) Delete(ctx context.Context, name string) error {
+	return s.DeleteMany(ctx, []string{name})
+}
+
+func (s *SheetsLog) DeleteMany(ctx context.Context, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	now := strconv.FormatInt(time.Now().UnixNano(), 10)
+	rows := make([][]string, 0, len(names))
+	for _, name := range names {
+		rows = append(rows, []string{name, "", now, "delete"})
+	}
+	return s.appendRows(ctx, rows)
+}
+
+func (s *SheetsLog) appendRows(ctx context.Context, rows [][]string) error {
 	encodedRange := url.PathEscape(s.rangeName)
 	values := url.Values{}
 	values.Set("valueInputOption", "RAW")
 	values.Set("insertDataOption", "INSERT_ROWS")
 	body, err := json.Marshal(map[string]any{
 		"majorDimension": "ROWS",
-		"values":         [][]string{row},
+		"values":         rows,
 	})
 	if err != nil {
 		return err

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,11 +27,16 @@ func NewDriveStore(httpClient *GoogleHTTPClient, token string, cfg DriveConfig) 
 }
 
 func (d *DriveStore) Put(ctx context.Context, name string, data []byte) error {
+	_, err := d.PutObject(ctx, name, data)
+	return err
+}
+
+func (d *DriveStore) PutObject(ctx context.Context, name string, data []byte) (ObjectInfo, error) {
 	var body bytes.Buffer
 	boundary := fmt.Sprintf("skirk-%d", time.Now().UnixNano())
 	writer := multipart.NewWriter(&body)
 	if err := writer.SetBoundary(boundary); err != nil {
-		return err
+		return ObjectInfo{}, err
 	}
 	metadata := map[string]any{
 		"name":          name,
@@ -42,28 +48,28 @@ func (d *DriveStore) Put(ctx context.Context, name string, data []byte) error {
 	}
 	metaBytes, err := json.Marshal(metadata)
 	if err != nil {
-		return err
+		return ObjectInfo{}, err
 	}
 	metaHeader := textproto.MIMEHeader{}
 	metaHeader.Set("Content-Type", "application/json; charset=UTF-8")
 	metaPart, err := writer.CreatePart(metaHeader)
 	if err != nil {
-		return err
+		return ObjectInfo{}, err
 	}
 	if _, err := metaPart.Write(metaBytes); err != nil {
-		return err
+		return ObjectInfo{}, err
 	}
 	dataHeader := textproto.MIMEHeader{}
 	dataHeader.Set("Content-Type", "application/octet-stream")
 	dataPart, err := writer.CreatePart(dataHeader)
 	if err != nil {
-		return err
+		return ObjectInfo{}, err
 	}
 	if _, err := dataPart.Write(data); err != nil {
-		return err
+		return ObjectInfo{}, err
 	}
 	if err := writer.Close(); err != nil {
-		return err
+		return ObjectInfo{}, err
 	}
 	headers := map[string]string{
 		"Authorization": "Bearer " + d.token,
@@ -71,9 +77,21 @@ func (d *DriveStore) Put(ctx context.Context, name string, data []byte) error {
 	}
 	result, err := d.http.Request(ctx, http.MethodPost, "www.googleapis.com", "/upload/drive/v3/files?uploadType=multipart&fields=id,name,size", headers, body.Bytes())
 	if err != nil {
-		return err
+		return ObjectInfo{}, err
 	}
-	return require2xx(result, "drive upload")
+	if err := require2xx(result, "drive upload"); err != nil {
+		return ObjectInfo{}, err
+	}
+	var payload struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+		Size string `json:"size"`
+	}
+	if err := json.Unmarshal(result.Body, &payload); err != nil {
+		return ObjectInfo{}, err
+	}
+	size, _ := strconv.ParseInt(payload.Size, 10, 64)
+	return ObjectInfo{Name: payload.Name, ID: payload.ID, Size: size}, nil
 }
 
 func (d *DriveStore) Get(ctx context.Context, name string) ([]byte, error) {
@@ -87,6 +105,18 @@ func (d *DriveStore) Get(ctx context.Context, name string) ([]byte, error) {
 		return nil, err
 	}
 	if err := require2xx(result, "drive download"); err != nil {
+		return nil, err
+	}
+	return result.Body, nil
+}
+
+func (d *DriveStore) GetByID(ctx context.Context, fileID string) ([]byte, error) {
+	path := "/drive/v3/files/" + url.PathEscape(fileID) + "?alt=media"
+	result, err := d.http.Request(ctx, http.MethodGet, "www.googleapis.com", path, d.authHeaders(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := require2xx(result, "drive download by id"); err != nil {
 		return nil, err
 	}
 	return result.Body, nil
@@ -139,6 +169,52 @@ func (d *DriveStore) Delete(ctx context.Context, name string) error {
 		}
 		if result.Status != http.StatusNoContent && result.Status != http.StatusOK && result.Status != http.StatusNotFound {
 			return require2xx(result, "drive delete")
+		}
+	}
+	return nil
+}
+
+func (d *DriveStore) DeleteID(ctx context.Context, fileID string) error {
+	result, err := d.http.Request(ctx, http.MethodDelete, "www.googleapis.com", "/drive/v3/files/"+url.PathEscape(fileID), d.authHeaders(), nil)
+	if err != nil {
+		return err
+	}
+	if result.Status == http.StatusNoContent || result.Status == http.StatusOK || result.Status == http.StatusNotFound {
+		return nil
+	}
+	return require2xx(result, "drive delete id")
+}
+
+func (d *DriveStore) DeleteIDs(ctx context.Context, fileIDs []string, concurrency int) error {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	jobs := make(chan string)
+	errs := make(chan error, len(fileIDs))
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for id := range jobs {
+				if id == "" {
+					continue
+				}
+				if err := d.DeleteID(ctx, id); err != nil {
+					errs <- err
+				}
+			}
+		}()
+	}
+	for _, id := range fileIDs {
+		jobs <- id
+	}
+	close(jobs)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			return err
 		}
 	}
 	return nil

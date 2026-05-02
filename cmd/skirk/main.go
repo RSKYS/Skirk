@@ -136,6 +136,7 @@ func hybridSend(ctx context.Context, args []string) error {
 	input := fs.String("input", "", "input file")
 	session := fs.String("session", "", "session id")
 	chunkSize := fs.Int("chunk-size", 0, "chunk size")
+	concurrency := fs.Int("concurrency", 0, "Drive upload concurrency")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -153,7 +154,11 @@ func hybridSend(ctx context.Context, args []string) error {
 	if *chunkSize > 0 {
 		size = *chunkSize
 	}
-	result, err := skirk.HybridSendFile(ctx, drive, sheets, *input, cfg.Secret, firstNonEmpty(*session, cfg.SessionID), skirk.DirectionUp, size, false)
+	workers := cfg.Tunnel.Concurrency
+	if *concurrency > 0 {
+		workers = *concurrency
+	}
+	result, err := skirk.HybridSendFileBulk(ctx, drive, sheets, *input, cfg.Secret, firstNonEmpty(*session, cfg.SessionID), skirk.DirectionUp, skirk.HybridBulkOptions{ChunkSize: size, Concurrency: workers})
 	if err != nil {
 		return err
 	}
@@ -166,6 +171,7 @@ func hybridRecv(ctx context.Context, args []string) error {
 	output := fs.String("output", "", "output file")
 	session := fs.String("session", "", "session id")
 	deleteAfter := fs.Bool("delete-after", false, "delete data/control after receive")
+	concurrency := fs.Int("concurrency", 0, "Drive download/cleanup concurrency")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -179,9 +185,18 @@ func hybridRecv(ctx context.Context, args []string) error {
 	if cfg.Sheets.SpreadsheetID == "" {
 		return fmt.Errorf("config.sheets.spreadsheet_id is required")
 	}
-	result, err := skirk.HybridReceiveFile(ctx, drive, sheets, *output, cfg.Secret, *session, skirk.DirectionUp, *deleteAfter)
+	workers := cfg.Tunnel.Concurrency
+	if *concurrency > 0 {
+		workers = *concurrency
+	}
+	result, err := skirk.HybridReceiveFileBulk(ctx, drive, sheets, *output, cfg.Secret, *session, skirk.DirectionUp, skirk.HybridBulkOptions{ChunkSize: cfg.Tunnel.ChunkSize, Concurrency: workers})
 	if err != nil {
 		return err
+	}
+	if *deleteAfter {
+		if err := cleanupHybrid(ctx, drive, sheets, result.DriveFileIDs, result.DriveObjects, result.ControlRows, workers); err != nil {
+			return err
+		}
 	}
 	return printJSON(result)
 }
@@ -216,13 +231,18 @@ func e2e(ctx context.Context, args []string) error {
 		return err
 	}
 	start := time.Now()
-	send, err := skirk.HybridSendFile(ctx, drive, sheets, input, cfg.Secret, cfg.SessionID, skirk.DirectionUp, cfg.Tunnel.ChunkSize, false)
+	send, err := skirk.HybridSendFileBulk(ctx, drive, sheets, input, cfg.Secret, cfg.SessionID, skirk.DirectionUp, skirk.HybridBulkOptions{ChunkSize: cfg.Tunnel.ChunkSize, Concurrency: cfg.Tunnel.Concurrency})
 	if err != nil {
 		return err
 	}
-	recv, err := skirk.HybridReceiveFile(ctx, drive, sheets, output, cfg.Secret, send.SessionID, skirk.DirectionUp, *deleteAfter)
+	recv, err := skirk.HybridReceiveFileBulk(ctx, drive, sheets, output, cfg.Secret, send.SessionID, skirk.DirectionUp, skirk.HybridBulkOptions{ChunkSize: cfg.Tunnel.ChunkSize, Concurrency: cfg.Tunnel.Concurrency})
 	if err != nil {
 		return err
+	}
+	if *deleteAfter {
+		if err := cleanupHybrid(ctx, drive, sheets, recv.DriveFileIDs, recv.DriveObjects, recv.ControlRows, cfg.Tunnel.Concurrency); err != nil {
+			return err
+		}
 	}
 	roundtrip, err := os.ReadFile(output)
 	if err != nil {
@@ -247,6 +267,7 @@ func e2e(ctx context.Context, args []string) error {
 type benchCase struct {
 	SizeBytes     int     `json:"size_bytes"`
 	ChunkSize     int     `json:"chunk_size"`
+	Concurrency   int     `json:"concurrency"`
 	SendChunks    int     `json:"send_chunks"`
 	ReceiveChunks int     `json:"receive_chunks"`
 	SendMS        int64   `json:"send_ms"`
@@ -264,6 +285,7 @@ func bench(ctx context.Context, args []string) error {
 	configPath := fs.String("config", "skirk.json", "config path")
 	sizesText := fs.String("sizes", "8192,65536", "comma-separated payload sizes in bytes")
 	chunksText := fs.String("chunk-sizes", "8192,65536", "comma-separated chunk sizes in bytes")
+	concurrency := fs.Int("concurrency", 0, "Drive upload/download/cleanup concurrency")
 	tempWorkspace := fs.Bool("temp-workspace", false, "create and delete a temporary control spreadsheet")
 	title := fs.String("title", "skirk-bench", "temporary spreadsheet title")
 	if err := fs.Parse(args); err != nil {
@@ -298,6 +320,10 @@ func bench(ctx context.Context, args []string) error {
 	if cfg.Sheets.SpreadsheetID == "" {
 		return fmt.Errorf("config.sheets.spreadsheet_id is required unless --temp-workspace is used")
 	}
+	workers := cfg.Tunnel.Concurrency
+	if *concurrency > 0 {
+		workers = *concurrency
+	}
 
 	tmpDir, err := os.MkdirTemp("", "skirk-bench-*")
 	if err != nil {
@@ -317,34 +343,34 @@ func bench(ctx context.Context, args []string) error {
 		for _, chunkSize := range chunkSizes {
 			output := filepath.Join(tmpDir, fmt.Sprintf("output-%d-%d.bin", size, chunkSize))
 			startSend := time.Now()
-			send, err := skirk.HybridSendFile(ctx, drive, sheets, input, cfg.Secret, "", skirk.DirectionUp, chunkSize, false)
+			send, err := skirk.HybridSendFileBulk(ctx, drive, sheets, input, cfg.Secret, "", skirk.DirectionUp, skirk.HybridBulkOptions{ChunkSize: chunkSize, Concurrency: workers})
 			sendDuration := time.Since(startSend)
 			if err != nil {
 				return err
 			}
 
 			startReceive := time.Now()
-			recv, err := skirk.HybridReceiveFile(ctx, drive, sheets, output, cfg.Secret, send.SessionID, skirk.DirectionUp, false)
+			recv, err := skirk.HybridReceiveFileBulk(ctx, drive, sheets, output, cfg.Secret, send.SessionID, skirk.DirectionUp, skirk.HybridBulkOptions{ChunkSize: chunkSize, Concurrency: workers})
 			receiveDuration := time.Since(startReceive)
 			if err != nil {
-				_ = cleanupHybrid(ctx, drive, sheets, send.DriveObjects, send.ControlRows)
+				_ = cleanupHybrid(ctx, drive, sheets, send.DriveFileIDs, send.DriveObjects, send.ControlRows, workers)
 				return err
 			}
 
 			startVerify := time.Now()
 			roundtrip, err := os.ReadFile(output)
 			if err != nil {
-				_ = cleanupHybrid(ctx, drive, sheets, recv.DriveObjects, recv.ControlRows)
+				_ = cleanupHybrid(ctx, drive, sheets, recv.DriveFileIDs, recv.DriveObjects, recv.ControlRows, workers)
 				return err
 			}
 			if !bytes.Equal(payload, roundtrip) {
-				_ = cleanupHybrid(ctx, drive, sheets, recv.DriveObjects, recv.ControlRows)
+				_ = cleanupHybrid(ctx, drive, sheets, recv.DriveFileIDs, recv.DriveObjects, recv.ControlRows, workers)
 				return fmt.Errorf("payload mismatch for size=%d chunk=%d", size, chunkSize)
 			}
 			verifyDuration := time.Since(startVerify)
 
 			startCleanup := time.Now()
-			if err := cleanupHybrid(ctx, drive, sheets, recv.DriveObjects, recv.ControlRows); err != nil {
+			if err := cleanupHybrid(ctx, drive, sheets, recv.DriveFileIDs, recv.DriveObjects, recv.ControlRows, workers); err != nil {
 				return err
 			}
 			cleanupDuration := time.Since(startCleanup)
@@ -354,6 +380,7 @@ func bench(ctx context.Context, args []string) error {
 			cases = append(cases, benchCase{
 				SizeBytes:     size,
 				ChunkSize:     chunkSize,
+				Concurrency:   workers,
 				SendChunks:    send.Chunks,
 				ReceiveChunks: recv.Chunks,
 				SendMS:        sendDuration.Milliseconds(),
@@ -374,18 +401,19 @@ func bench(ctx context.Context, args []string) error {
 	})
 }
 
-func cleanupHybrid(ctx context.Context, drive *skirk.DriveStore, sheets *skirk.SheetsLog, dataObjects, controlRows []string) error {
-	for _, name := range dataObjects {
-		if err := drive.Delete(ctx, name); err != nil {
+func cleanupHybrid(ctx context.Context, drive *skirk.DriveStore, sheets *skirk.SheetsLog, dataIDs, dataObjects, controlRows []string, concurrency int) error {
+	if len(dataIDs) > 0 {
+		if err := drive.DeleteIDs(ctx, dataIDs, concurrency); err != nil {
 			return err
 		}
-	}
-	for _, name := range controlRows {
-		if err := sheets.Delete(ctx, name); err != nil {
-			return err
+	} else {
+		for _, name := range dataObjects {
+			if err := drive.Delete(ctx, name); err != nil {
+				return err
+			}
 		}
 	}
-	return nil
+	return sheets.DeleteMany(ctx, controlRows)
 }
 
 func parseIntList(value string) ([]int, error) {
@@ -470,6 +498,7 @@ func sampleConfig(args []string) error {
 	proxy := fs.String("proxy", "socks5h://127.0.0.1:1080", "upstream restricted-network proxy")
 	routeMode := fs.String("route-mode", "real_pinned", "route mode: direct, real_pinned, google_front_pinned")
 	googleIP := fs.String("google-ip", "216.239.38.120", "Google edge IP for pinned routing")
+	concurrency := fs.Int("concurrency", 8, "Drive upload/download concurrency")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -487,7 +516,7 @@ func sampleConfig(args []string) error {
 		Auth:      skirk.AuthConfig{TokenCommand: "gcloud auth print-access-token"},
 		Route:     skirk.RouteConfig{Mode: *routeMode, Proxy: *proxy, GoogleIP: *googleIP, TimeoutSeconds: 240},
 		Sheets:    skirk.SheetsConfig{SpreadsheetID: *spreadsheetID, Range: "skirk!A:D"},
-		Tunnel:    skirk.TunnelConfig{Listen: "127.0.0.1:18080", ChunkSize: 8192, PollIntervalMS: 1200, CleanupProcessed: true},
+		Tunnel:    skirk.TunnelConfig{Listen: "127.0.0.1:18080", ChunkSize: 1024 * 1024, PollIntervalMS: 1200, Concurrency: *concurrency, CleanupProcessed: true},
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
